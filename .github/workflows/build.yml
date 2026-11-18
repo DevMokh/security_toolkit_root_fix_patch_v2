@@ -1,0 +1,117 @@
+name: Security Toolkit Android APK
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-toolkit-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Locate Flutter project root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Repository: $GITHUB_WORKSPACE"
+          if [[ -f "$GITHUB_WORKSPACE/pubspec.yaml" && -f "$GITHUB_WORKSPACE/lib/main.dart" ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+          else
+            mapfile -t CANDIDATES < <(
+              find "$GITHUB_WORKSPACE" \\
+                -type d \( -name .git -o -name .dart_tool -o -name build \) -prune -o \\
+                -type f -name pubspec.yaml -print |
+              while IFS= read -r file; do
+                dir="$(dirname "$file")"
+                [[ -f "$dir/lib/main.dart" ]] && printf '%s\n' "$dir"
+              done | sort
+            )
+            if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
+              echo "ERROR: No Flutter project found (pubspec.yaml + lib/main.dart)."
+              find "$GITHUB_WORKSPACE" -maxdepth 6 -name pubspec.yaml -print || true
+              exit 1
+            fi
+            if [[ "${#CANDIDATES[@]}" -gt 1 ]]; then
+              echo "ERROR: Multiple Flutter projects found; refusing to guess:"
+              printf '%s\n' "${CANDIDATES[@]}"
+              exit 1
+            fi
+            PROJECT_DIR="${CANDIDATES[0]}"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project root: $PROJECT_DIR"
+          test -f "$PROJECT_DIR/pubspec.yaml"
+          test -f "$PROJECT_DIR/lib/main.dart"
+
+      - name: Regenerate Android host with V2 embedding
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/bootstrap_android.sh" "$PROJECT_DIR"
+
+      - name: Verify Android V2 embedding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/verify_android_embedding.py" "$PROJECT_DIR"
+
+      - name: Get dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          test -f pubspec.yaml
+          flutter pub get
+
+      - name: Analyze Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter analyze
+
+      - name: Run Flutter tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter test
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-toolkit-release-apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
